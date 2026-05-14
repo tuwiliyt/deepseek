@@ -112,6 +112,34 @@ def chat_completions():
     # ── Streaming ──────────────────────────────────────────────────────────
     if stream:
         def _generate():
+            """
+            Parse SSE stream dari DeepSeek baris per baris.
+            Masalah utama: Qwen Code CLI mensyaratkan chunk terakhir
+            sebelum [DONE] memiliki finish_reason != null.
+            DeepSeek internal API kadang mengirim finish_reason: null
+            atau stream putus tanpa marker yang benar.
+            Fix: track chunk terakhir dan inject finish_reason="stop"
+            jika belum ada sebelum mengirim [DONE].
+            """
+            last_chunk = None
+            done_sent  = False
+
+            def flush_finish_reason():
+                """Kirim chunk penutup dengan finish_reason='stop' jika perlu."""
+                nonlocal last_chunk, done_sent
+                if done_sent:
+                    return
+                if last_chunk is not None:
+                    choices = last_chunk.get("choices", [])
+                    if choices and choices[0].get("finish_reason") is None:
+                        choices[0]["finish_reason"] = "stop"
+                        # Pastikan delta tidak kosong agar CLI tidak confused
+                        if "delta" in choices[0] and choices[0]["delta"] == {}:
+                            choices[0]["delta"] = {"content": ""}
+                        yield ("data: " + json.dumps(last_chunk) + "\n\n").encode()
+                yield b"data: [DONE]\n\n"
+                done_sent = True
+
             try:
                 with requests.post(
                     ds_url,
@@ -121,22 +149,63 @@ def chat_completions():
                     timeout=DEFAULT_TIMEOUT,
                 ) as ds_resp:
                     if ds_resp.status_code != 200:
-                        err = json.dumps({"error": {"message": ds_resp.text, "type": "proxy_error"}})
-                        yield f"data: {err}\n\n"
+                        err = json.dumps({
+                            "error": {"message": ds_resp.text[:500], "type": "deepseek_error"}
+                        })
+                        yield f"data: {err}\n\n".encode()
+                        yield b"data: [DONE]\n\n"
                         return
-                    for chunk in ds_resp.iter_content(chunk_size=None):
-                        if chunk:
-                            yield chunk
+
+                    for raw_line in ds_resp.iter_lines():
+                        if not raw_line:
+                            continue
+                        line = raw_line.decode("utf-8", errors="replace")
+
+                        if not line.startswith("data:"):
+                            continue
+
+                        data_str = line[5:].strip()
+
+                        # Stream selesai
+                        if data_str == "[DONE]":
+                            yield from flush_finish_reason()
+                            return
+
+                        # Parse chunk JSON
+                        try:
+                            chunk = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+
+                        choices = chunk.get("choices", [])
+
+                        # Jika chunk ini sudah punya finish_reason, kirim langsung
+                        # lalu emit [DONE] segera
+                        if choices and choices[0].get("finish_reason") is not None:
+                            yield ("data: " + json.dumps(chunk) + "\n\n").encode()
+                            yield b"data: [DONE]\n\n"
+                            done_sent = True
+                            return
+
+                        # Chunk biasa — buffer sebagai last_chunk, kirim sekarang
+                        last_chunk = chunk
+                        yield ("data: " + json.dumps(chunk) + "\n\n").encode()
+
+                # Stream habis tanpa [DONE] eksplisit
+                yield from flush_finish_reason()
+
             except Exception as exc:
                 err = json.dumps({"error": {"message": str(exc), "type": "proxy_error"}})
-                yield f"data: {err}\n\ndata: [DONE]\n\n"
+                yield f"data: {err}\n\n".encode()
+                if not done_sent:
+                    yield b"data: [DONE]\n\n"
 
         return Response(
             _generate(),
             status=200,
             mimetype="text/event-stream",
             headers={
-                "Cache-Control": "no-cache",
+                "Cache-Control":     "no-cache",
                 "X-Accel-Buffering": "no",
             },
         )
