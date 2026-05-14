@@ -113,32 +113,29 @@ def chat_completions():
     if stream:
         def _generate():
             """
-            Parse SSE stream dari DeepSeek baris per baris.
-            Masalah utama: Qwen Code CLI mensyaratkan chunk terakhir
-            sebelum [DONE] memiliki finish_reason != null.
-            DeepSeek internal API kadang mengirim finish_reason: null
-            atau stream putus tanpa marker yang benar.
-            Fix: track chunk terakhir dan inject finish_reason="stop"
-            jika belum ada sebelum mengirim [DONE].
-            """
-            last_chunk = None
-            done_sent  = False
+            Parse SSE baris per baris dan pastikan stream selalu ditutup
+            dengan chunk berisi finish_reason='stop' + 'data: [DONE]'.
 
-            def flush_finish_reason():
-                """Kirim chunk penutup dengan finish_reason='stop' jika perlu."""
-                nonlocal last_chunk, done_sent
-                if done_sent:
-                    return
-                if last_chunk is not None:
-                    choices = last_chunk.get("choices", [])
-                    if choices and choices[0].get("finish_reason") is None:
-                        choices[0]["finish_reason"] = "stop"
-                        # Pastikan delta tidak kosong agar CLI tidak confused
-                        if "delta" in choices[0] and choices[0]["delta"] == {}:
-                            choices[0]["delta"] = {"content": ""}
-                        yield ("data: " + json.dumps(last_chunk) + "\n\n").encode()
-                yield b"data: [DONE]\n\n"
-                done_sent = True
+            Bug sebelumnya: flush_finish_reason() me-re-emit last_chunk yang
+            SUDAH dikirim → konten dobel di layar.
+
+            Fix: buat stop_chunk BARU yang hanya berisi delta:{} dan
+            finish_reason='stop' (standar OpenAI), bukan re-kirim last_chunk.
+            """
+            # Metadata dari chunk pertama untuk synthetic stop chunk
+            stream_id    = None
+            stream_model = None
+            got_finish   = False   # apakah finish_reason sudah diterima
+
+            def _make_stop_chunk() -> bytes:
+                """Buat chunk penutup standar OpenAI dengan finish_reason='stop'."""
+                stop = {
+                    "id":      stream_id or "chatcmpl-proxy",
+                    "object":  "chat.completion.chunk",
+                    "model":   stream_model or "deepseek-chat",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                }
+                return ("data: " + json.dumps(stop) + "\n\n").encode()
 
             try:
                 with requests.post(
@@ -150,7 +147,11 @@ def chat_completions():
                 ) as ds_resp:
                     if ds_resp.status_code != 200:
                         err = json.dumps({
-                            "error": {"message": ds_resp.text[:500], "type": "deepseek_error"}
+                            "error": {
+                                "message": ds_resp.text[:500],
+                                "type":    "deepseek_error",
+                                "code":    ds_resp.status_code,
+                            }
                         })
                         yield f"data: {err}\n\n".encode()
                         yield b"data: [DONE]\n\n"
@@ -160,44 +161,50 @@ def chat_completions():
                         if not raw_line:
                             continue
                         line = raw_line.decode("utf-8", errors="replace")
-
                         if not line.startswith("data:"):
                             continue
 
                         data_str = line[5:].strip()
 
-                        # Stream selesai
+                        # DeepSeek menandai akhir stream dengan [DONE]
                         if data_str == "[DONE]":
-                            yield from flush_finish_reason()
+                            if not got_finish:
+                                yield _make_stop_chunk()
+                            yield b"data: [DONE]\n\n"
                             return
 
-                        # Parse chunk JSON
                         try:
                             chunk = json.loads(data_str)
                         except json.JSONDecodeError:
                             continue
 
-                        choices = chunk.get("choices", [])
+                        # Ambil metadata untuk synthetic stop chunk
+                        if stream_id is None:
+                            stream_id    = chunk.get("id")
+                            stream_model = chunk.get("model")
 
-                        # Jika chunk ini sudah punya finish_reason, kirim langsung
-                        # lalu emit [DONE] segera
-                        if choices and choices[0].get("finish_reason") is not None:
+                        choices = chunk.get("choices", [])
+                        fr = choices[0].get("finish_reason") if choices else None
+
+                        if fr is not None:
+                            # Chunk ini sudah punya finish_reason — kirim dan selesai
+                            got_finish = True
                             yield ("data: " + json.dumps(chunk) + "\n\n").encode()
                             yield b"data: [DONE]\n\n"
-                            done_sent = True
                             return
 
-                        # Chunk biasa — buffer sebagai last_chunk, kirim sekarang
-                        last_chunk = chunk
+                        # Chunk konten biasa
                         yield ("data: " + json.dumps(chunk) + "\n\n").encode()
 
                 # Stream habis tanpa [DONE] eksplisit
-                yield from flush_finish_reason()
+                if not got_finish:
+                    yield _make_stop_chunk()
+                yield b"data: [DONE]\n\n"
 
             except Exception as exc:
                 err = json.dumps({"error": {"message": str(exc), "type": "proxy_error"}})
                 yield f"data: {err}\n\n".encode()
-                if not done_sent:
+                if not got_finish:
                     yield b"data: [DONE]\n\n"
 
         return Response(

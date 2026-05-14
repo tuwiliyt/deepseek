@@ -2,17 +2,6 @@
 # =============================================================================
 # run_deepseek.sh — Launcher Qwen Code CLI + DeepSeek Proxy
 # =============================================================================
-# Cara kerja:
-#   1. Jalankan proxy.py di background (port 8088)
-#   2. Tunggu proxy siap
-#   3. Set env vars agar Qwen Code CLI terhubung ke proxy (bukan Qwen cloud)
-#   4. Jalankan qwen CLI dengan workaround Colab (script -q -c ...)
-#   5. Matikan proxy saat CLI keluar
-#
-# Penggunaan:
-#   ./scripts/run_deepseek.sh                    # interactive mode
-#   ./scripts/run_deepseek.sh "tugas singkat"    # one-shot
-# =============================================================================
 
 set -euo pipefail
 
@@ -34,8 +23,6 @@ export QWEN_CODE_LANG="${QWEN_CODE_LANG:-id}"
 # ── Konfigurasi proxy sebagai endpoint OpenAI ─────────────────────────────
 export OPENAI_API_KEY="ds-free-via-proxy"
 export OPENAI_BASE_URL="${PROXY_URL}"
-
-# Beberapa versi Qwen Code menggunakan env ini
 export QWEN_API_BASE="${PROXY_URL}"
 export QWEN_API_KEY="ds-free-via-proxy"
 
@@ -81,8 +68,9 @@ done
 cd "$PROJECT_DIR"
 
 # ── Jalankan Qwen Code CLI ────────────────────────────────────────────────
-# Workaround Colab: gunakan `script -q -c` agar PTY tersedia
-# (tanpa ini, qwen menampilkan error tty/ioctl di Colab)
+# Workaround Colab: script -q -c menyediakan PTY buatan.
+# JANGAN pipe output ke program lain — Qwen Code adalah TUI interaktif,
+# piping (|) akan memutus PTY dan respons tidak tampil.
 
 QWEN_ARGS=(
     qwen
@@ -98,15 +86,4 @@ fi
 echo "[DeepSeek CLI] Memulai Qwen Code CLI → DeepSeek..."
 echo "----------------------------------------------------"
 
-script -q -c "$(printf '%q ' "${QWEN_ARGS[@]}")" /dev/null \
-  | python3 -c '
-import sys, re
-ansi = re.compile(rb"\x1b\[[0-9;]*[mGKHFJA-Za-z]")
-for line in sys.stdin.buffer:
-    clean = ansi.sub(b"", line)
-    # Hapus baris "script started/done" dari output
-    if re.search(rb"[Ss]cript\s+(started|done)", clean):
-        continue
-    sys.stdout.buffer.write(clean)
-    sys.stdout.buffer.flush()
-'
+script -q -c "$(printf '%q ' "${QWEN_ARGS[@]}")" /dev/null
