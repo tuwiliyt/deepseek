@@ -1,6 +1,9 @@
 # config.py - Konfigurasi DeepSeek Free CLI
 # Endpoint internal DeepSeek (dari sesi browser, bukan API resmi)
-DEEPSEEK_API_BASE   = "https://chat.deepseek.com/api/v0"
+# PENTING: endpoint asli adalah /chat/completion (tanpa 's')
+# bukan /chat/completions seperti OpenAI standard
+DEEPSEEK_API_BASE      = "https://chat.deepseek.com/api/v0"
+DEEPSEEK_CHAT_ENDPOINT = f"{DEEPSEEK_API_BASE}/chat/completion"
 
 # Endpoint proxy lokal yang dijalankan oleh proxy.py
 # Qwen Code CLI akan terhubung ke sini
